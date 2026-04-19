@@ -1,0 +1,1135 @@
+-- Window proxy — loader injects real Window via Kaitun.setWindow()
+local _realWindow = nil
+local Window = {
+    Notify = function(self, t)
+        if _realWindow then _realWindow:Notify(t) end
+    end
+}
+
+-- ============================================================
+-- Kaitun Farm — tpgpo tween teleport + new UI lib
+-- Features: Farm Peli → Buy Rifle → Equip → Fishman Island
+--           → Set Spawn (Robo) → Go to farm pos → Kill Fishman Karate Users
+--           → Auto dump SkillPoints into GunMastery on toggle
+--           → Becky Quest auto-loop at Level 190+
+-- ============================================================
+
+-- ============================================================
+-- SERVICES
+-- ============================================================
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService   = game:GetService("TeleportService")
+local HttpService       = game:GetService("HttpService")
+local player            = Players.LocalPlayer
+
+-- ============================================================
+-- CONFIG
+-- ============================================================
+local TARGET_PELI      = 300
+local TRAVEL_SPEED     = 70
+local UNDERWATER_SPEED = 30
+local ALTITUDE         = 200
+
+local FISHMAN_CAVE  = Vector3.new(1838,   4,     -12173)
+local FISHMAN_SPAWN = Vector3.new(7977,   -2153, -17074)
+local FISHMAN_FINAL = Vector3.new(7827,   -2129, -17135)
+
+-- Becky quest config (positions sourced from Feral Kaitun decompiled script)
+local BECKY_POS     = Vector3.new(7733, -2176, -17218)  -- Becky NPC underwater
+local FARM_POS      = Vector3.new(7838, -2151, -17134)  -- Fishman Karate farm spot
+local BECKY_QUEST   = "Help becky"
+local BECKY_MIN_LVL = 190
+
+-- ============================================================
+-- STATE
+-- ============================================================
+local State = {
+    active               = false,
+    thread               = nil,
+    arrivedAtFarm        = false,
+    shouldKeepRifle      = false,
+    rifleEquipCooldown   = 5,
+    lastRifleEquipTime   = 0,
+    riflePurchaseDone    = false,
+    lastRifleBuyTime     = 0,
+    rifleBuyCooldown     = 300,
+    connections          = {},
+    character            = nil,
+    gunStats             = nil,
+    autoGunMasteryActive = false,
+    -- Webhook
+    webhookUrl           = "",
+    webhookSendLevelUp   = true,
+    lastLevel            = 0,
+    sessionStartLevel    = 0,
+    sessionStartPeli     = 0,
+    sessionStartTime     = 0,
+}
+
+-- ============================================================
+-- HELPERS — stats
+-- ============================================================
+local function getPlayerName() return player.Name end
+
+local function getStat(name)
+    local ok, v = pcall(function()
+        local s = ReplicatedStorage:FindFirstChild("Stats" .. getPlayerName())
+        return s and s:FindFirstChild("Stats") and s.Stats:FindFirstChild(name) and s.Stats[name].Value or 0
+    end)
+    return ok and v or 0
+end
+
+local function getPeli()  return getStat("Peli") end
+local function getLevel() return getStat("Level") end
+
+local function getCurrentQuest()
+    local ok, v = pcall(function()
+        return ReplicatedStorage:FindFirstChild("Stats" .. getPlayerName()).Quest.CurrentQuest.Value
+    end)
+    return ok and v or ""
+end
+
+-- Quest GUI visible = quest is accepted/active
+local function isQuestActive()
+    local ok, v = pcall(function()
+        return player.PlayerGui.Quest.Enabled
+    end)
+    return ok and v or false
+end
+
+-- ============================================================
+-- AUTO GUN MASTERY
+-- ============================================================
+local function startAutoGunMastery()
+    if State.autoGunMasteryActive then return end
+    State.autoGunMasteryActive = true
+    State.connections.autoGunMastery = task.spawn(function()
+        while State.active and State.autoGunMasteryActive do
+            pcall(function()
+                local data = ReplicatedStorage:FindFirstChild("Stats" .. getPlayerName())
+                if data and data:FindFirstChild("Stats") then
+                    local skillPoints = data.Stats:FindFirstChild("SkillPoints")
+                    if skillPoints and skillPoints.Value > 0 then
+                        local pointsToAdd = skillPoints.Value
+                        ReplicatedStorage:WaitForChild("Events"):WaitForChild("stats")
+                            :FireServer("GunMastery", nil, pointsToAdd)
+                        task.wait(0.15)
+                    end
+                end
+            end)
+            task.wait(1)
+        end
+    end)
+end
+
+local function stopAutoGunMastery()
+    State.autoGunMasteryActive = false
+end
+
+-- ============================================================
+-- WEBHOOK HELPERS
+-- ============================================================
+local function formatNumber(n)
+    if not n then return "0" end
+    if n >= 1e9 then return string.format("%.1fB", n / 1e9)
+    elseif n >= 1e6 then return string.format("%.1fM", n / 1e6)
+    elseif n >= 1e3 then return string.format("%.1fK", n / 1e3)
+    else return tostring(math.floor(n)) end
+end
+
+local function getSessionDuration()
+    local secs = os.time() - (State.sessionStartTime > 0 and State.sessionStartTime or os.time())
+    local m = math.floor(secs / 60)
+    local s = secs % 60
+    return string.format("%dm %ds", m, s)
+end
+
+-- ============================================================
+-- SEND WEBHOOK
+-- Mirrors thebest__1_.lua sendWebhook() exactly —
+-- rich embed with Current Stats + Session Info fields
+-- ============================================================
+local function sendWebhook(title, description, color)
+    if State.webhookUrl == "" or State.webhookUrl == nil then return end
+    task.spawn(function()
+        pcall(function()
+            local currentPeli    = getPeli()
+            local currentLevel   = getLevel()
+            local peliGained     = currentPeli  - State.sessionStartPeli
+            local levelsGained   = currentLevel - State.sessionStartLevel
+
+            local embed = {
+                ["embeds"] = { {
+                    ["title"]       = title,
+                    ["description"] = description,
+                    ["color"]       = color or 3447003,
+                    ["fields"] = {
+                        {
+                            ["name"]   = "Current Stats",
+                            ["value"]  = string.format(
+                                "Level: %d (+%d)\nPeli: %s (+%s)",
+                                currentLevel, levelsGained,
+                                formatNumber(currentPeli), formatNumber(peliGained)
+                            ),
+                            ["inline"] = true
+                        },
+                        {
+                            ["name"]   = "Session Info",
+                            ["value"]  = string.format(
+                                "Duration: %s\nPlayer: %s",
+                                getSessionDuration(), player.Name
+                            ),
+                            ["inline"] = true
+                        }
+                    },
+                    ["footer"]    = { ["text"] = "Kaitun Hub | " .. os.date("%H:%M:%S") },
+                    ["timestamp"] = os.date("!%Y-%m-%dT%H:%M:%SZ")
+                } }
+            }
+
+            local reqFn = request or http_request or
+                (syn and syn.request) or
+                (fluxus and fluxus.request) or
+                (krnl and krnl.request)
+            if reqFn then
+                reqFn({
+                    Url     = State.webhookUrl,
+                    Method  = "POST",
+                    Headers = { ["Content-Type"] = "application/json" },
+                    Body    = game:GetService("HttpService"):JSONEncode(embed)
+                })
+            end
+        end)
+    end)
+end
+
+-- ============================================================
+-- LEVEL MONITOR — fires webhook on level up (every 3s poll)
+-- Mirrors thebest__1_.lua startLevelMonitoring()
+-- ============================================================
+local function startLevelMonitor()
+    State.connections.levelMonitor = task.spawn(function()
+        while State.active do
+            task.wait(3)
+            pcall(function()
+                local currentLevel = getLevel()
+                if currentLevel > State.lastLevel and State.lastLevel > 0 then
+                    if State.webhookSendLevelUp then
+                        sendWebhook(
+                            "Level Up! 🎉",
+                            string.format("Reached **Level %d**!", currentLevel),
+                            65280  -- green
+                        )
+                    end
+                    Window:Notify({
+                        Title    = "Level Up!",
+                        Desc     = "Now Level " .. currentLevel,
+                        Duration = 3,
+                        Kind     = "success"
+                    })
+                end
+                State.lastLevel = currentLevel
+            end)
+        end
+    end)
+end
+
+
+-- ============================================================
+-- GUN STATS
+-- ============================================================
+local function collectGunStats()
+    local stats = {}
+    local statNames = {
+        "Level", "Peli", "Strength", "Defense", "Speed",
+        "Fruit", "Sword", "Gun", "Devil", "Beli",
+        "Bounty", "Honor", "Raid", "RaidPoints",
+        "Race", "Blox", "Mastery", "Accessory",
+    }
+    for _, name in ipairs(statNames) do
+        local val = getStat(name)
+        if val ~= 0 then stats[name] = val end
+    end
+    pcall(function()
+        local statsFolder = ReplicatedStorage:FindFirstChild("Stats" .. getPlayerName())
+        if statsFolder and statsFolder:FindFirstChild("Stats") then
+            for _, child in ipairs(statsFolder.Stats:GetChildren()) do
+                if child:IsA("ValueBase") then
+                    stats[child.Name] = child.Value
+                end
+            end
+        end
+    end)
+    pcall(function()
+        local rifle = player.Backpack:FindFirstChild("Rifle")
+            or (player.Character and player.Character:FindFirstChild("Rifle"))
+        if rifle then
+            stats["GunName"] = rifle.Name
+            stats["GunTool"] = rifle
+            for _, v in ipairs(rifle:GetDescendants()) do
+                if v:IsA("ValueBase") then
+                    stats["Gun_" .. v.Name] = v.Value
+                end
+            end
+        end
+    end)
+    pcall(function()
+        local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        if hrp then stats["ShootOriginCFrame"] = hrp.CFrame end
+    end)
+    return stats
+end
+
+local function hasRifle()
+    local ok, v = pcall(function()
+        local bp = player:FindFirstChild("Backpack")
+        local ch = player.Character
+        return (bp and bp:FindFirstChild("Rifle") ~= nil)
+            or (ch and ch:FindFirstChild("Rifle") ~= nil)
+    end)
+    return ok and v or false
+end
+
+local function isRifleEquipped()
+    local ok, v = pcall(function()
+        local ch = player.Character
+        return ch and ch:FindFirstChild("Rifle") ~= nil
+    end)
+    return ok and v or false
+end
+
+local function isSpawnAt(name)
+    local ok, v = pcall(function()
+        local pn    = getPlayerName()
+        local stats = ReplicatedStorage:FindFirstChild("Stats" .. pn)
+        if not stats then return false end
+        local spawnPoint = stats:FindFirstChild("SpawnPoint")
+        if not spawnPoint then return false end
+        return spawnPoint.Value == name
+    end)
+    return ok and v or false
+end
+
+-- ============================================================
+-- HELPERS — character
+-- ============================================================
+local function getCharacter()
+    return player.Character or player.CharacterAdded:Wait()
+end
+
+local function getFreshHRP()
+    local ch  = player.Character or player.CharacterAdded:Wait()
+    local hrp = ch:WaitForChild("HumanoidRootPart", 5)
+    return hrp, ch
+end
+
+-- ============================================================
+-- TPGPO TWEEN TELEPORT
+-- ============================================================
+local lastDashFire = 0
+local function fireDash(hrp)
+    if tick() - lastDashFire < 0.5 then return end
+    lastDashFire = tick()
+    pcall(function()
+        ReplicatedStorage:WaitForChild("Events"):WaitForChild("takestam")
+            :FireServer(0.54, "dash", hrp.CFrame)
+    end)
+end
+
+local function makeRayParams(character)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local list = { character, workspace:FindFirstChild("PlayerCharacters"), workspace:FindFirstChild("Effects") }
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character then table.insert(list, p.Character) end
+    end
+    params.FilterDescendantsInstances = list
+    return params
+end
+
+local function getGroundY(x, z, params, fallbackY, underwater)
+    local origin = Vector3.new(x, fallbackY + 300, z)
+    local dir    = Vector3.new(0, -2000, 0)
+    local hit    = workspace:Raycast(origin, dir, params)
+    while hit and (not hit.Instance.CanCollide and not hit.Instance.CanQuery
+        or hit.Instance.Name == "Leaves") do
+        hit = workspace:Raycast(hit.Position - Vector3.new(0, 0.1, 0), dir, params)
+    end
+    if not hit then return underwater and fallbackY or math.max(fallbackY, 2) end
+    local groundY = hit.Position.Y + 5
+    return underwater and groundY or math.max(groundY, 2)
+end
+
+local function isTpStrikeActive()
+    local hit = false
+    pcall(function()
+        for _, obj in ipairs(player.PlayerGui.Notifications:GetDescendants()) do
+            if obj:IsA("TextLabel") then
+                local t = obj.Text
+                if t == "TP" or t == "Strike" or t:find("Strike") then
+                    hit = true
+                    return
+                end
+            end
+        end
+    end)
+    return hit
+end
+
+local function tweenTeleport(dest, speed, underwater)
+    if not State.active then return end
+    local ch  = player.Character or player.CharacterAdded:Wait()
+    local hrp = ch:WaitForChild("HumanoidRootPart", 5)
+    if not hrp then return end
+
+    speed      = speed or TRAVEL_SPEED
+    underwater = underwater or false
+
+    if (Vector2.new(hrp.Position.X, hrp.Position.Z)
+        - Vector2.new(dest.X, dest.Z)).Magnitude < 2 then
+        hrp.CFrame   = CFrame.new(dest)
+        hrp.Velocity = Vector3.zero
+        return
+    end
+
+    local params = makeRayParams(ch)
+
+    while State.active do
+        local origin = hrp.Position
+        local dist2D = (Vector2.new(origin.X, origin.Z) - Vector2.new(dest.X, dest.Z)).Magnitude
+        if dist2D < 2 then break end
+
+        if isTpStrikeActive() then
+            task.wait(5)
+            ch  = player.Character or player.CharacterAdded:Wait()
+            hrp = ch:WaitForChild("HumanoidRootPart", 5)
+            if not hrp then return end
+            params = makeRayParams(ch)
+            continue
+        end
+
+        fireDash(hrp)
+
+        local dt    = RunService.RenderStepped:Wait()
+        local step  = math.min(speed * dt, dist2D)
+        local dir2D = Vector2.new(dest.X - origin.X, dest.Z - origin.Z).Unit
+        local newX  = origin.X + dir2D.X * step
+        local newZ  = origin.Z + dir2D.Y * step
+        local newY  = getGroundY(newX, newZ, params, origin.Y, underwater)
+
+        hrp.Velocity = Vector3.zero
+        hrp.CFrame   = CFrame.new(newX, newY, newZ)
+    end
+
+    if not State.active then return end
+    local finalY = getGroundY(dest.X, dest.Z, params, hrp.Position.Y, underwater)
+    hrp.CFrame   = CFrame.new(dest.X, finalY, dest.Z)
+    hrp.Velocity = Vector3.zero
+end
+
+-- ============================================================
+-- EQUIP RIFLE
+-- ============================================================
+local function equipRifle()
+    task.spawn(function()
+        for attempt = 1, 5 do
+            if not State.active then return end
+            pcall(function()
+                ReplicatedStorage:WaitForChild("Events"):WaitForChild("Tools")
+                    :InvokeServer("equip", "Rifle")
+            end)
+            task.wait(0.4)
+            pcall(function()
+                local ch  = player.Character
+                local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+                local bp  = player:FindFirstChild("Backpack")
+                if hum and bp then
+                    local rifle = bp:FindFirstChild("Rifle")
+                    if rifle and rifle:IsA("Tool") then hum:EquipTool(rifle) end
+                end
+            end)
+            task.wait(0.6)
+            if isRifleEquipped() then
+                State.shouldKeepRifle = true
+                return
+            end
+        end
+        pcall(function()
+            local ch = player.Character
+            local bp = player:FindFirstChild("Backpack")
+            if ch and bp then
+                local rifle = bp:FindFirstChild("Rifle")
+                if rifle then rifle.Parent = ch end
+            end
+        end)
+        task.wait(0.3)
+        State.shouldKeepRifle = isRifleEquipped()
+    end)
+end
+
+-- ============================================================
+-- BUY RIFLE from Lily
+-- ============================================================
+local function buyRifle()
+    local now = tick()
+    if now - State.lastRifleBuyTime < State.rifleBuyCooldown and State.riflePurchaseDone then return end
+    if hasRifle() then
+        Window:Notify({ Title = "Rifle", Desc = "Already owned!", Duration = 2, Kind = "success" })
+        return
+    end
+
+    local hrp = State.character and State.character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    Window:Notify({ Title = "Kaitun", Desc = "Navigating to Lily to buy Rifle...", Duration = 3, Kind = "info" })
+
+    local lily = workspace:FindFirstChild("NPCs") and workspace.NPCs:FindFirstChild("Lily")
+    if lily then
+        local lilyPart = lily:FindFirstChild("HumanoidRootPart") or lily.PrimaryPart or lily:FindFirstChildWhichIsA("BasePart")
+        if lilyPart then
+            tweenTeleport(lilyPart.Position + Vector3.new(0, 3, 0), TRAVEL_SPEED, false)
+            if not State.active then return end
+            task.wait(1)
+
+            local currentPeli = getPeli()
+            if currentPeli < TARGET_PELI then
+                Window:Notify({ Title = "Rifle", Desc = "Not enough Peli: " .. currentPeli .. "/" .. TARGET_PELI, Duration = 3, Kind = "warn" })
+                return
+            end
+
+            pcall(function()
+                ReplicatedStorage:WaitForChild("Events"):WaitForChild("Shop"):InvokeServer(
+                    workspace:WaitForChild("BuyableItems"):WaitForChild("Rifle"), 1
+                )
+            end)
+            State.riflePurchaseDone = true
+            State.lastRifleBuyTime  = tick()
+            task.wait(2)
+
+            if hasRifle() then
+                Window:Notify({ Title = "Rifle", Desc = "Purchased successfully!", Duration = 3, Kind = "success" })
+            else
+                Window:Notify({ Title = "Rifle", Desc = "Purchase may have failed.", Duration = 3, Kind = "warn" })
+            end
+        end
+    else
+        Window:Notify({ Title = "Rifle", Desc = "Lily NPC not found in NPCs folder.", Duration = 3, Kind = "warn" })
+    end
+end
+
+-- ============================================================
+-- PELI FARM LOOP (chest collection)
+-- ============================================================
+local cachedPrompts = {}
+local function cacheProximityPrompts()
+    table.clear(cachedPrompts)
+    local descendants = workspace:GetDescendants()
+    for i, desc in ipairs(descendants) do
+        if desc:IsA("ProximityPrompt") then
+            local txt = ((desc.ObjectText or "") .. (desc.ActionText or "") .. (desc.Name or "")):lower()
+            if txt:find("open") or txt:find("peli") or txt:find("chest") then
+                local p = desc.Parent
+                local pos
+                if p and p:IsA("BasePart") then pos = p.Position
+                elseif p and p:IsA("Model") then
+                    local part = p.PrimaryPart or p:FindFirstChildWhichIsA("BasePart")
+                    pos = part and part.Position
+                end
+                if pos then cachedPrompts[desc] = { position = pos } end
+            end
+        end
+        if i % 100 == 0 then task.wait() end
+    end
+end
+
+local function tryTriggerPrompts()
+    local hrp = State.character and State.character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    local pos = hrp.Position
+    for prompt, data in pairs(cachedPrompts) do
+        pcall(function()
+            if prompt and prompt.Parent and prompt.Enabled then
+                if (pos - data.position).Magnitude <= (prompt.MaxActivationDistance or 0) then
+                    fireproximityprompt(prompt)
+                end
+            else
+                cachedPrompts[prompt] = nil
+            end
+        end)
+    end
+end
+
+local visitedParts = {}
+local function findNearestChest()
+    local env = workspace:FindFirstChild("Env")
+    if not env then return nil end
+    local hrp = State.character and State.character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+    local pos = hrp.Position
+    local nearest, minDist = nil, math.huge
+    for _, obj in ipairs(env:GetChildren()) do
+        if obj.Name == "Part" and obj:IsA("BasePart") and not visitedParts[obj] then
+            for _, d in ipairs(obj:GetDescendants()) do
+                if d:IsA("ProximityPrompt") then
+                    local dist = (pos - obj.Position).Magnitude
+                    if dist < minDist then nearest, minDist = obj, dist end
+                    break
+                end
+            end
+        end
+    end
+    if not nearest then
+        local count = 0
+        for _ in pairs(visitedParts) do count = count + 1 end
+        if count > 50 then table.clear(visitedParts) end
+    end
+    return nearest
+end
+
+local function serverHop()
+    Window:Notify({ Title = "Kaitun", Desc = "No chests — server hopping...", Duration = 3, Kind = "warn" })
+    local ok, data = pcall(function()
+        return HttpService:JSONDecode(game:HttpGet(
+            "https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100"
+        ))
+    end)
+    if ok and data and data.data then
+        for _, sv in ipairs(data.data) do
+            if sv.playing ~= sv.maxPlayers and sv.id ~= game.JobId then
+                pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, sv.id) end)
+                task.wait(6)
+                return
+            end
+        end
+    end
+    task.wait(10)
+end
+
+local function farmPeliLoop()
+    local searchFails = 0
+    cacheProximityPrompts()
+
+    State.character = getCharacter()
+    local hrp = State.character:WaitForChild("HumanoidRootPart")
+    local hum = State.character:WaitForChild("Humanoid")
+
+    hum.PlatformStand = true
+    hum.WalkSpeed = 0
+    hum.JumpPower = 0
+    pcall(function()
+        ReplicatedStorage:WaitForChild("Events"):WaitForChild("takestam"):FireServer(0.505, "dash")
+    end)
+    task.wait(0.5)
+    hrp.CFrame = CFrame.new(hrp.CFrame.Position + Vector3.new(0, ALTITUDE, 0))
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+
+    State.connections.antigravity = RunService.Heartbeat:Connect(function()
+        pcall(function()
+            if hrp.Parent then
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.AssemblyAngularVelocity = Vector3.zero
+            end
+        end)
+    end)
+
+    State.connections.dashLoop = task.spawn(function()
+        while State.active do
+            task.wait(1.5)
+            pcall(function()
+                ReplicatedStorage:WaitForChild("Events"):WaitForChild("takestam"):FireServer(0.505, "dash")
+            end)
+        end
+    end)
+
+    State.connections.promptClicker = task.spawn(function()
+        while State.active do
+            tryTriggerPrompts()
+            RunService.Heartbeat:Wait()
+        end
+    end)
+
+    while State.active do
+        local currentPeli = getPeli()
+        if currentPeli >= TARGET_PELI or hasRifle() then break end
+
+        hrp, State.character = getFreshHRP()
+        local chest = findNearestChest()
+
+        if not chest then
+            searchFails = searchFails + 1
+            if searchFails >= 3 then
+                serverHop()
+                searchFails = 0
+            end
+            task.wait(1)
+        else
+            searchFails = 0
+            visitedParts[chest] = true
+            tweenTeleport(chest.Position + Vector3.new(0, 50, 0), TRAVEL_SPEED, false)
+            if not State.active then return end
+            tweenTeleport(chest.Position + Vector3.new(0, 3, 0), TRAVEL_SPEED, false)
+            task.wait(1)
+        end
+
+        RunService.Heartbeat:Wait()
+    end
+
+    if State.connections.antigravity then
+        State.connections.antigravity:Disconnect()
+        State.connections.antigravity = nil
+    end
+
+    hum.PlatformStand = false
+    hum.WalkSpeed = 16
+    hum.JumpPower = 50
+end
+
+-- ============================================================
+-- HELPERS — island detection
+-- ============================================================
+local function getCurrentIsland()
+    local nearest, nearestDist = nil, math.huge
+    pcall(function()
+        for _, isle in ipairs(workspace.Islands:GetChildren()) do
+            local d = (isle:GetPivot().Position - player.Character:GetPivot().Position).Magnitude
+            if d < nearestDist then
+                nearest = isle
+                nearestDist = d
+            end
+        end
+    end)
+    return nearest
+end
+
+local function getSpawnPoint()
+    local ok, v = pcall(function()
+        return ReplicatedStorage:FindFirstChild("Stats" .. player.Name).Stats.SpawnPoint.Value
+    end)
+    return ok and v or ""
+end
+
+local function getStamina()
+    local ok, v = pcall(function()
+        local txt = player.PlayerGui.HUD.Main.Bars.Stamina.Detail.Progress.Text
+        return tonumber(txt:match("^(%d+)")) or 100
+    end)
+    return ok and v or 100
+end
+
+-- ============================================================
+-- FISHMAN ISLAND ROUTE
+-- ============================================================
+local function doFishmanRoute()
+    local CAVE_POS  = Vector3.new(1838, 4, -12173)
+    local ROBO_POS  = Vector3.new(7977, -2153, -17074)
+    local FARM_POS_ = Vector3.new(7839, -2151, -17135)
+
+    while State.active do
+        local hrp, ch = getFreshHRP()
+        if not hrp then task.wait(1) continue end
+
+        local island = getCurrentIsland()
+        local islandName = island and island.Name or ""
+
+        if islandName ~= "Fishman Island" then
+            local caveDistXZ = (Vector2.new(CAVE_POS.X, CAVE_POS.Z)
+                - Vector2.new(hrp.Position.X, hrp.Position.Z)).Magnitude
+
+            local portalPart
+            pcall(function() portalPart = workspace.AreaTeleporters.FirstSea.Fishman.Part end)
+
+            if caveDistXZ > 300 then
+                Window:Notify({ Title = "Kaitun", Desc = "Moving to Fishman Cave...", Duration = 3, Kind = "info" })
+                tweenTeleport(CAVE_POS, TRAVEL_SPEED, false)
+
+            elseif portalPart then
+                local portalPos = portalPart.Position
+                local portalDistXZ = (Vector2.new(portalPos.X, portalPos.Z)
+                    - Vector2.new(hrp.Position.X, hrp.Position.Z)).Magnitude
+
+                if portalDistXZ < 10 then
+                    Window:Notify({ Title = "Kaitun", Desc = "At portal — waiting stamina...", Duration = 3, Kind = "info" })
+                    repeat task.wait() until getStamina() > 10 or not State.active
+                    if not State.active then return end
+
+                    ReplicatedStorage:WaitForChild("Events"):WaitForChild("takestam"):FireServer(0.525, "dash")
+                    task.wait(0.5)
+                    hrp, ch = getFreshHRP()
+                    hrp.CFrame = CFrame.new(portalPos)
+                    Window:Notify({ Title = "Kaitun", Desc = "Entering Fishman Island — waiting 10s...", Duration = 10, Kind = "info" })
+                    task.wait(10)
+                else
+                    Window:Notify({ Title = "Kaitun", Desc = "Moving to Fishman portal...", Duration = 3, Kind = "info" })
+                    tweenTeleport(portalPos, TRAVEL_SPEED, false)
+                end
+            end
+
+        elseif islandName == "Fishman Island" then
+            if getSpawnPoint() ~= "Fishman Island" then
+                Window:Notify({ Title = "Kaitun", Desc = "Setting spawn via Robo...", Duration = 3, Kind = "info" })
+                tweenTeleport(ROBO_POS, UNDERWATER_SPEED, true)
+                if not State.active then return end
+
+                pcall(function()
+                    local robo = workspace.NPCs:FindFirstChild("Robo")
+                    if robo then
+                        ReplicatedStorage:WaitForChild("Events"):WaitForChild("SetSpawn"):FireServer(nil, robo)
+                        ReplicatedStorage:WaitForChild("Events"):WaitForChild("Quest"):InvokeServer({ "npcChat", true })
+                    end
+                end)
+                task.wait(1)
+
+            elseif (FARM_POS_ - hrp.Position).Magnitude > 10 then
+                Window:Notify({ Title = "Kaitun", Desc = "Moving to farm position...", Duration = 3, Kind = "info" })
+                tweenTeleport(FARM_POS_, UNDERWATER_SPEED, true)
+                if not State.active then return end
+
+                Window:Notify({ Title = "Kaitun", Desc = "Arrived at farm!", Duration = 4, Kind = "success" })
+                State.arrivedAtFarm = true
+                return
+            else
+                State.arrivedAtFarm = true
+                return
+            end
+        end
+
+        task.wait(0.1)
+    end
+end
+
+-- ============================================================
+-- BECKY QUEST — accept + return to farm (level 190+)
+--
+-- Reverse-engineered from Feral Kaitun decompiled script:
+--   Condition (line 8983): currentQuest ~= "Help becky" AND level >= 190
+--   Becky position (line 6694): Vector3(7733, -2176, -17218)
+--   Accept pattern (line 7624, L_2068): quit → wait 1.5s → takequest
+--   Return to farm (line 6737+): back to Vector3(7838, -2151, -17134)
+-- ============================================================
+local function acceptBeckyQuest()
+    if not State.active then return end
+
+    local QuestEvent = ReplicatedStorage:WaitForChild("Events"):WaitForChild("Quest")
+
+    Window:Notify({
+        Title    = "Becky Quest",
+        Desc     = "Swimming to Becky NPC...",
+        Duration = 3,
+        Kind     = "info"
+    })
+
+    tweenTeleport(BECKY_POS, TRAVEL_SPEED, true)
+    if not State.active then return end
+    task.wait(0.3)
+    if not State.active then return end
+
+    local accepted = false
+    local attempts = 0
+    repeat
+        attempts = attempts + 1
+        pcall(function() QuestEvent:InvokeServer({ "quit" }) end)
+        task.wait(0.3)
+        if not State.active then return end
+        pcall(function() QuestEvent:InvokeServer({ "takequest", BECKY_QUEST }) end)
+        task.wait(0.3)
+        accepted = isQuestActive() or getCurrentQuest() == BECKY_QUEST
+    until accepted or attempts >= 5 or not State.active
+
+    if accepted then
+        Window:Notify({ Title = "Becky Quest", Desc = "Quest accepted! Returning to farm...", Duration = 3, Kind = "success" })
+    else
+        Window:Notify({ Title = "Becky Quest", Desc = "Could not accept quest — resuming farm.", Duration = 3, Kind = "warn" })
+    end
+
+    if not State.active then return end
+    tweenTeleport(FARM_POS, TRAVEL_SPEED, true)
+end
+
+-- ============================================================
+-- FARM FISHMAN KARATE USERS
+-- Every 10s: if level >= 190 and quest ~= "Help becky", go accept it.
+-- ============================================================
+local function farmFishmanKarateUsers()
+    task.spawn(function()
+        local Events       = ReplicatedStorage:WaitForChild("Events")
+        local GunManager   = Events:WaitForChild("GunManager")
+        local gunFunctions = GunManager:WaitForChild("gunFunctions")
+
+        local function getTargets()
+            local t = {}
+            local npcs = workspace:FindFirstChild("NPCs")
+            if npcs then
+                for _, npc in ipairs(npcs:GetChildren()) do
+                    if npc.Name == "Fishman Karate User" then
+                        table.insert(t, npc)
+                    end
+                end
+            end
+            return t
+        end
+
+        local function shootAtTarget(targetHead)
+            local gs = State.gunStats
+            local shootOrigin
+            pcall(function()
+                local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+                if hrp then shootOrigin = hrp.CFrame end
+            end)
+            if not shootOrigin then
+                shootOrigin = gs and gs.ShootOriginCFrame or CFrame.new(
+                    7838.86767578125, -2150.707275390625, -17139.39453125,
+                    0.971501350402832,   0.218903049826622,   0.09092045575380325,
+                    0.08188118785619736, 0.05003693699836731, -0.9953853487968445,
+                   -0.22244228422641754, 0.9744627475738525,   0.030686836689710617
+                )
+            end
+            local currentPosition = targetHead.CFrame.Position
+            local fireArgs = {
+                "fire",
+                {
+                    Start    = shootOrigin,
+                    Gun      = (gs and gs.GunName) or "Rifle",
+                    joe      = "true",
+                    Position = currentPosition,
+                    Level    = gs and gs.Level    or getStat("Level"),
+                    Peli     = gs and gs.Peli     or getStat("Peli"),
+                    Strength = gs and gs.Strength or getStat("Strength"),
+                    Defense  = gs and gs.Defense  or getStat("Defense"),
+                    Speed    = gs and gs.Speed    or getStat("Speed"),
+                    Fruit    = gs and gs.Fruit    or getStat("Fruit"),
+                    Sword    = gs and gs.Sword    or getStat("Sword"),
+                    GunStat  = gs and gs.Gun      or getStat("Gun"),
+                    Devil    = gs and gs.Devil    or getStat("Devil"),
+                    Beli     = gs and gs.Beli     or getStat("Beli"),
+                    Bounty   = gs and gs.Bounty   or getStat("Bounty"),
+                    Honor    = gs and gs.Honor    or getStat("Honor"),
+                    Mastery  = gs and gs.Mastery  or getStat("Mastery"),
+                }
+            }
+            GunManager:FireServer(unpack(fireArgs))
+            task.wait(0.1)
+            pcall(function()
+                gunFunctions:InvokeServer("reload", {
+                    Gun     = (gs and gs.GunName) or "Rifle",
+                    Level   = gs and gs.Level    or getStat("Level"),
+                    GunStat = gs and gs.Gun      or getStat("Gun"),
+                    Mastery = gs and gs.Mastery  or getStat("Mastery"),
+                })
+            end)
+        end
+
+        local lastBeckyCheck     = 0
+        local BECKY_CHECK_INTERVAL = 10
+
+        while State.active do
+
+            -- ── BECKY QUEST CHECK ─────────────────────────────────────
+            -- Mirrors feral script logic: if level >= 190 and not on Becky quest, go take it
+            local now = tick()
+            if now - lastBeckyCheck >= BECKY_CHECK_INTERVAL then
+                lastBeckyCheck = now
+                pcall(function()
+                    local lvl   = getLevel()
+                    local quest = getCurrentQuest()
+                    if lvl >= BECKY_MIN_LVL and quest ~= BECKY_QUEST then
+                        Window:Notify({
+                            Title    = "Becky Quest",
+                            Desc     = "Lvl " .. lvl .. " — going to accept Becky quest!",
+                            Duration = 4,
+                            Kind     = "info"
+                        })
+                        acceptBeckyQuest()
+                    end
+                end)
+            end
+            -- ─────────────────────────────────────────────────────────
+
+            local targets = getTargets()
+            if #targets == 0 then
+                task.wait(0.1)
+            else
+                for _, targetNPC in ipairs(targets) do
+                    if not State.active then return end
+                    if targetNPC and targetNPC.Parent then
+                        local targetHead = targetNPC:FindFirstChild("Head")
+                        local humanoid   = targetNPC:FindFirstChild("Humanoid")
+                        if targetHead and humanoid and humanoid.Health > 0 then
+                            while humanoid.Health > 0 and targetNPC.Parent and State.active do
+                                targetHead = targetNPC:FindFirstChild("Head")
+                                if targetHead then
+                                    shootAtTarget(targetHead)
+                                else
+                                    break
+                                end
+                                task.wait(0.05)
+                            end
+                            task.wait(0.3)
+                        end
+                    end
+                end
+            end
+            task.wait(0.25)
+        end
+    end)
+end
+
+-- ============================================================
+-- RIFLE RE-EQUIP WATCHER
+-- ============================================================
+local function startRifleWatcher()
+    State.connections.rifleWatcher = task.spawn(function()
+        while State.active do
+            task.wait(5)
+            pcall(function()
+                if State.shouldKeepRifle and hasRifle() and not isRifleEquipped() then
+                    local now = tick()
+                    if now - State.lastRifleEquipTime >= State.rifleEquipCooldown then
+                        State.lastRifleEquipTime = now
+                        equipRifle()
+                    end
+                end
+            end)
+        end
+    end)
+end
+
+-- ============================================================
+-- CLEANUP
+-- ============================================================
+local function cleanup()
+    State.active   = false
+    State.gunStats = nil
+    stopAutoGunMastery()
+    for k, v in pairs(State.connections) do
+        pcall(function()
+            if typeof(v) == "RBXScriptConnection" then v:Disconnect()
+            elseif type(v) == "thread" then task.cancel(v) end
+        end)
+        State.connections[k] = nil
+    end
+    pcall(function()
+        local ch  = player.Character
+        if not ch then return end
+        local hrp = ch:FindFirstChild("HumanoidRootPart")
+        local hum = ch:FindFirstChild("Humanoid")
+        if hum then hum.PlatformStand = false hum.WalkSpeed = 16 hum.JumpPower = 50 end
+        if hrp then hrp.Anchored = false hrp.AssemblyLinearVelocity = Vector3.zero end
+    end)
+end
+
+-- ============================================================
+-- MAIN KAITUN FLOW
+-- ============================================================
+local function startKaitun()
+    if State.active then return end
+    State.active        = true
+    State.arrivedAtFarm = false
+    -- Seed session stats for webhook embed
+    State.sessionStartTime  = os.time()
+    State.sessionStartLevel = getLevel()
+    State.sessionStartPeli  = getPeli()
+    State.lastLevel         = getLevel()
+
+    State.gunStats = collectGunStats()
+    Window:Notify({
+        Title    = "Kaitun",
+        Desc     = "Stats loaded! Lvl " .. (State.gunStats.Level or 0)
+                   .. " | Gun " .. (State.gunStats.Gun or 0)
+                   .. " | Mastery " .. (State.gunStats.Mastery or 0),
+        Duration = 4,
+        Kind     = "info"
+    })
+
+    startAutoGunMastery()
+    Window:Notify({
+        Title    = "Gun Mastery",
+        Desc     = "Auto dumping SkillPoints into GunMastery...",
+        Duration = 3,
+        Kind     = "info"
+    })
+
+    Window:Notify({ Title = "Kaitun", Desc = "Starting Kaitun farm...", Duration = 4, Kind = "success" })
+
+    State.thread = task.spawn(function()
+        if not hasRifle() then
+            local currentPeli = getPeli()
+            if currentPeli < TARGET_PELI then
+                Window:Notify({ Title = "Kaitun", Desc = "Farming Peli ("..currentPeli.."/"..TARGET_PELI..")...", Duration = 4, Kind = "info" })
+                farmPeliLoop()
+                if not State.active then return end
+            end
+
+            Window:Notify({ Title = "Kaitun", Desc = "Target Peli reached — buying Rifle...", Duration = 3, Kind = "info" })
+            buyRifle()
+            if not State.active then return end
+            task.wait(3)
+        end
+
+        State.gunStats = collectGunStats()
+
+        Window:Notify({ Title = "Kaitun", Desc = "Equipping Rifle...", Duration = 2, Kind = "info" })
+        State.character = getCharacter()
+        State.shouldKeepRifle = true
+        equipRifle()
+        task.wait(2)
+
+        State.gunStats = collectGunStats()
+        startRifleWatcher()
+        startLevelMonitor()
+
+        if not State.arrivedAtFarm then
+            doFishmanRoute()
+            if not State.active then return end
+        end
+
+        -- Immediate Becky check on farm start if already 190+
+        if State.active and getLevel() >= BECKY_MIN_LVL and getCurrentQuest() ~= BECKY_QUEST then
+            Window:Notify({
+                Title    = "Becky Quest",
+                Desc     = "Level 190+ detected — accepting Becky quest first!",
+                Duration = 4,
+                Kind     = "info"
+            })
+            acceptBeckyQuest()
+            if not State.active then return end
+        end
+
+        if State.active then
+            Window:Notify({ Title = "Kaitun", Desc = "Farming Fishman Karate Users!", Duration = 3, Kind = "success" })
+            farmFishmanKarateUsers()
+        end
+    end)
+end
+
+local function stopKaitun()
+    Window:Notify({ Title = "Kaitun", Desc = "Farm stopped.", Duration = 3, Kind = "warn" })
+    cleanup()
+    if State.thread then
+        pcall(function() task.cancel(State.thread) end)
+        State.thread = nil
+    end
+end
+
+-- ============================================================
+-- RETURN API (used by loader)
+-- ============================================================
+return {
+    setFarm = function(v)
+        if v then startKaitun() else stopKaitun() end
+    end,
+    setWindow = function(w)
+        _realWindow = w
+    end,
+    setWebhook = function(url)
+        State.webhookUrl = url
+    end,
+    setWebhookLevelUp = function(v)
+        State.webhookSendLevelUp = v
+    end,
+    sendTestWebhook = function()
+        sendWebhook("Test Message 🔔", "This is a test from Kaitun Hub.", 3447003)
+    end,
+}
